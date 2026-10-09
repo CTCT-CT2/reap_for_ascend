@@ -1,0 +1,14 @@
+# Install only in a CANN-compatible environment. For production, prefer the
+# version-matched vLLM-Ascend image declared in Dockerfile.
+--index-url https://pypi.tuna.tsinghua.edu.cn/simple
+
+torch==2.10.0
+torch-npu==2.10.0.post4
+transformers==5.5.4
+accelerate==1.15.0
+datasets>=3.6.0,<4.0.0
+safetensors>=0.5.0
+numpy>=1.26.0
+pyyaml>=6.0
+tqdm>=4.66.0
+pytest>=8.4.1

@@ -1,4 +1,4 @@
-"""Convert datasets to transformers BatchEncoded or vLLM TokensPrompt formats.
+"""Convert calibration datasets to model-ready batches.
 
 We follow the OpenAI spec for conversational datasets.
 
@@ -9,9 +9,8 @@ messages = [
     {"role": "assistant", "content": "What is my purpose?"},
 ]
 
-Includes the ability to select from specific categories within the dataset and convert
-the dataset into either a language modelling dataset with attention applied to every
-token or a prompt-completion dataset for training on completions only with SFTTrainer.
+The processors normalize conversational datasets and optionally group samples by
+category for representative MoE expert observation.
 """
 
 from __future__ import annotations
@@ -27,7 +26,14 @@ import logging
 import torch
 from datasets import Dataset, DatasetDict, load_dataset
 from transformers import AutoTokenizer, BatchEncoding
-from vllm import TokensPrompt
+try:
+    from vllm import TokensPrompt
+except ImportError:
+    # Calibration and pruning do not require vLLM unless the caller explicitly
+    # requests vLLM token prompts. Keep the core REAP path usable with the
+    # Transformers/Ascend environment alone.
+    class TokensPrompt(dict):
+        pass
 
 
 logger = logging.getLogger(__name__)

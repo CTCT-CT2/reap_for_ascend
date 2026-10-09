@@ -1,7 +1,6 @@
 # Git
 .git/
 .gitignore
-.gitmodules
 
 # Python
 .venv/
@@ -18,3 +17,8 @@ uv.lock
 
 # Large data directories
 artifacts/
+*.pt
+*.tar.gz
+*.jsonl
+models/
+.cache/

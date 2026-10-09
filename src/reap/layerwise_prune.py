@@ -3,13 +3,13 @@ Layerwise Expert Pruning for MoE Models.
 
 This module provides a memory-efficient entry point for expert pruning
 that processes the model one layer at a time, enabling calibration of
-large MoE models on a single GPU.
+large MoE models on a single Ascend NPU.
 
 Key differences from standard prune.py:
 1. Model is loaded on CPU with device_map="cpu"
-2. Only one transformer block is on GPU at a time
+2. Only one transformer block is on NPU at a time
 3. Hidden states are cached between blocks
-4. Significantly reduced GPU memory requirements
+4. Significantly reduced NPU HBM requirements
 
 Usage:
     python -m reap.layerwise_prune \
@@ -22,36 +22,31 @@ Usage:
 
 from __future__ import annotations
 import logging
-import dataclasses
 import pathlib
 import hashlib
 from typing import Any, Dict, List
-import yaml
-
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
+from transformers import AutoTokenizer, HfArgumentParser
 
 from accelerate.utils import set_seed
 
 from reap.args import (
     ReapArgs,
     ModelArgs,
-    EvalArgs,
     PruneArgs,
     ObserverArgs,
     DatasetArgs,
-    ClusterArgs,
     LayerwiseArgs,
 )
 from reap.data import load_category_batches, parse_composite_dataset_spec
-from reap.model_util import patched_model_map
+from reap.model_util import load_reap_model
 from reap.observer import OBSERVER_CONFIG_REGISTRY
 from reap.layerwise_observer import LayerwiseMoEObserver
 from reap.layerwise_model_utils import cleanup_memory
-from reap.eval import run_evaluate
 from reap.prune import prune as prune_model
 from reap.prune import get_pruned_model_dir
 from reap.main import dump_args_to_yaml, create_results_directory
+from reap.npu import require_npu
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -158,7 +153,7 @@ def record_activations_layerwise(
     Record MoE activations using layerwise processing.
 
     This function processes the model one block at a time to minimize
-    GPU memory usage.
+    NPU HBM usage.
     """
     logger.info("Starting layerwise activation recording...")
 
@@ -219,9 +214,7 @@ def main():
             DatasetArgs,
             ObserverArgs,
             ModelArgs,
-            EvalArgs,
             PruneArgs,
-            ClusterArgs,
             LayerwiseArgs,
         )
     )
@@ -230,16 +223,14 @@ def main():
         ds_args,
         obs_args,
         model_args,
-        eval_args,
         prune_args,
-        cluster_args,
         layerwise_args,
     ) = parser.parse_args_into_dataclasses()
 
     # Validation
-    if prune_args.perserve_super_experts and prune_args.perserve_outliers:
+    if prune_args.preserve_super_experts and prune_args.preserve_outliers:
         raise ValueError(
-            "Only one of perserve_super_experts or perserve_outliers can be True."
+            "Only one of preserve_super_experts or preserve_outliers can be true."
         )
     if (
         layerwise_args.batch_group_size is not None
@@ -247,11 +238,11 @@ def main():
     ):
         raise ValueError("layerwise batch_group_size must be at least 1 when provided.")
 
+    require_npu()
     set_seed(reap_args.seed)
     results_dir = create_results_directory(model_args.model_name, ds_args.dataset_name)
 
-    # Get patched model name if needed
-    model_name = patched_model_map(model_args.model_name)
+    model_name = model_args.model_name
 
     # Load tokenizer
     logger.info(f"Loading tokenizer for {model_name}...")
@@ -279,7 +270,7 @@ def main():
 
         # Load model on CPU for layerwise processing
         logger.info(f"Loading model {model_name} on CPU for layerwise processing...")
-        model = AutoModelForCausalLM.from_pretrained(
+        model = load_reap_model(
             model_name,
             device_map="cpu",
             torch_dtype="auto",
@@ -316,17 +307,13 @@ def main():
     # Calculate number of experts to prune
     n_experts_to_prune = prune_args.n_experts_to_prune
     if n_experts_to_prune is None:
-        if cluster_args.compression_ratio is None:
-            raise ValueError(
-                "Either n_experts_to_prune or compression_ratio must be set."
-            )
         total_experts = len(
             observer_data[next(iter(observer_data))]["expert_frequency"]
         )
-        n_experts_to_prune = int(total_experts * cluster_args.compression_ratio)
+        n_experts_to_prune = int(total_experts * prune_args.compression_ratio)
         logger.info(
             f"Calculated n_experts_to_prune: {n_experts_to_prune} "
-            f"(compression_ratio: {cluster_args.compression_ratio})"
+            f"(compression_ratio: {prune_args.compression_ratio})"
         )
     else:
         total_experts = len(
@@ -355,12 +342,12 @@ def main():
         )
     else:
         # Reload model on auto device for pruning
-        logger.info("Reloading model on GPU for pruning...")
+        logger.info("Reloading model on Ascend NPU for pruning...")
         if model is not None:
             del model
         cleanup_memory()
 
-        model = AutoModelForCausalLM.from_pretrained(
+        model = load_reap_model(
             model_name,
             device_map="auto",
             torch_dtype="auto",
@@ -388,31 +375,11 @@ def main():
             ds_args=ds_args,
             obs_args=obs_args,
             model_args=model_args,
-            eval_args=eval_args,
             prune_args=prune_args,
-            cluster_args=cluster_args,
             layerwise_args=layerwise_args,
         )
 
         logger.info("Pruning completed successfully!")
 
-    # Evaluation
-    if reap_args.do_eval:
-        logger.info("Starting evaluation...")
-        if model is not None:
-            del model
-        del observer_data
-        cleanup_memory()
-
-        model_args.model_name = pruned_model_dir
-        run_evaluate(
-            model_args,
-            pruned_model_dir / "eval",
-            eval_args,
-            reap_args.seed,
-        )
-
-
-# TODO(ivanl): unify with prune.py entrypoint
 if __name__ == "__main__":
     main()

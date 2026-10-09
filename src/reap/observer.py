@@ -95,7 +95,7 @@ class BaseTransformerObserver(ABC):
     def _move_state_tensors_to_cpu(self):
         """
         Move all tensors in the state dictionary to CPU.
-        This is useful before saving the state to avoid GPU memory issues.
+        This is useful before saving the state to avoid NPU HBM pressure.
         """
         for layer_number, layer_state in self.state.items():
             for key, value in layer_state.items():
@@ -165,7 +165,7 @@ class BaseTransformerObserver(ABC):
         Class method decorator to register a concrete observer implementation.
         'cls' is the class on which this decorator's factory is called (e.g.,
         MoEExpertObserver) 'sub_cls' is the class being decorated
-        (e.g., Llama4MoEExpertObserver).
+        (for example a model-specific expert observer).
         """
 
         def decorator(sub_cls: type[BaseTransformerObserver]):
@@ -220,13 +220,54 @@ class MoETransformerObserverConfig(BaseTransformerObserverHookConfig):
     num_experts_attr_name: str = "num_experts"
     top_k_attr_name: str = "top_k"
     fused_experts: bool = False
+    # Some implementations expose the router under a different name (for
+    # example Qwen3.5-MoE uses ``gate``), and some do not return routing data
+    # from the hooked module at all.
+    router_attr_name: str = "router"
+    batched_expert_weights: bool = False
     distance_measure: str = "angular"
     renormalize_router_weights: bool = False
     record_pruning_metrics_only: bool = False
 
 
+@torch.no_grad()
+def compute_batched_expert_activations(
+    experts: nn.Module,
+    flat_input: torch.Tensor,
+    num_experts: int,
+    chunk_size: int = 16,
+) -> torch.Tensor:
+    """Evaluate fused expert weights for every input token.
+
+    Qwen3.5 stores ``gate_up_proj`` and ``down_proj`` as batched tensors and
+    its expert module only accepts routed top-k indices. REAP needs the output
+    of every expert, so compute the expert MLPs in chunks to bound temporary
+    memory usage.
+    """
+
+    hidden_dim = flat_input.shape[-1]
+    activations = torch.zeros(
+        (num_experts, *flat_input.shape),
+        device=flat_input.device,
+        dtype=flat_input.dtype,
+    )
+    for start in range(0, num_experts, chunk_size):
+        end = min(start + chunk_size, num_experts)
+        gate_up = torch.einsum(
+            "th,cih->tci", flat_input, experts.gate_up_proj[start:end]
+        )
+        gate, up = gate_up.chunk(2, dim=-1)
+        expert_hidden = experts.act_fn(gate) * up
+        expert_out = torch.einsum(
+            "tci,chi->tch", expert_hidden, experts.down_proj[start:end]
+        )
+        activations[start:end] = expert_out.permute(1, 0, 2)
+    assert activations.shape == (num_experts, flat_input.shape[0], hidden_dim)
+    return activations
+
+
 class MoETransformerObserver(BaseTransformerObserver):
-    """MoE Transformer Observer for all methods including both pruning and merging."""
+    """Collect MoE routing and activation statistics for expert pruning."""
 
     def __init__(self, model, hook_config=None):
         self._current_attention_mask: Optional[torch.Tensor] = None
@@ -270,7 +311,7 @@ class MoETransformerObserver(BaseTransformerObserver):
 
     def _initialize_state(self, output: torch.Tensor, num_experts: int):
         # get device and shape info
-        output_hidden_states = output[0]
+        output_hidden_states = output[0] if isinstance(output, (tuple, list)) else output
         device = "cpu"
         hidden_dim = output_hidden_states.shape[-1]
         layer_state = initialize_pruning_state(num_experts, device=device)
@@ -328,10 +369,11 @@ class MoETransformerObserver(BaseTransformerObserver):
 
         @torch.no_grad()
         def _hook_fn(module, args, output):
-            if not len(output) >= 2:
+            if not self.hook_config.fused_experts and not isinstance(output, (tuple, list)):
                 raise ValueError(
                     f"Expected output of module {module.__class__.__name__} at layer "
-                    f"{layer_number} to be a tuple of at least length 2, got {len(output)}."
+                    f"{layer_number} to be a tuple of at least length 2, got "
+                    f"{type(output).__name__}."
                 )
             input = args[0]  # (batch_size, seq_len, hidden_dim)
             device = input.device
@@ -351,25 +393,46 @@ class MoETransformerObserver(BaseTransformerObserver):
             activations = torch.zeros((num_experts, *flat_input.shape), device=device)
 
             if self.hook_config.fused_experts:
-                _, router_scores = output  # (num_experts, total_tokens)
-                router_logits = module.router(flat_input)  # (total_tokens, num_experts)
-                _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
-                selected_experts = selected_experts.to(device)
-                router_indices = (
-                    torch.arange(batch_size * sequence_length, device=device)
-                    .view(1, -1)
-                    .expand(router_scores.size(0), -1)
-                )
-                router_indices = router_indices.reshape(-1, 1).expand(-1, hidden_dim)
-                routed_in = torch.gather(
-                    input=flat_input,
-                    dim=0,
-                    index=router_indices,
-                ).to(device)
-                # we do not apply router_scores
-                # record unweighted activations for all experts
-                routed_out = module.experts(routed_in)
-                activations = routed_out.view(num_experts, *flat_input.shape)
+                if self.hook_config.batched_expert_weights:
+                    # Qwen3.5-MoE returns only the combined hidden states from
+                    # its block. Re-run the router so the observer can collect
+                    # routing statistics, then evaluate all experts from their
+                    # fused [num_experts, ...] weight tensors.
+                    router = reduce(
+                        getattr,
+                        self.hook_config.router_attr_name.split("."),
+                        module,
+                    )
+                    router_logits, _, selected_experts = router(flat_input)
+                    selected_experts = selected_experts.to(device)
+                    activations = compute_batched_expert_activations(
+                        module.experts, flat_input, num_experts
+                    )
+                else:
+                    _, router_scores = output  # (num_experts, total_tokens)
+                    router = reduce(
+                        getattr,
+                        self.hook_config.router_attr_name.split("."),
+                        module,
+                    )
+                    router_logits = router(flat_input)  # (total_tokens, num_experts)
+                    _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
+                    selected_experts = selected_experts.to(device)
+                    router_indices = (
+                        torch.arange(batch_size * sequence_length, device=device)
+                        .view(1, -1)
+                        .expand(router_scores.size(0), -1)
+                    )
+                    router_indices = router_indices.reshape(-1, 1).expand(-1, hidden_dim)
+                    routed_in = torch.gather(
+                        input=flat_input,
+                        dim=0,
+                        index=router_indices,
+                    ).to(device)
+                    # we do not apply router_scores
+                    # record unweighted activations for all experts
+                    routed_out = module.experts(routed_in)
+                    activations = routed_out.view(num_experts, *flat_input.shape)
 
             else:  # loop based MoE execution
                 # ernie returns combined_output, combine_weights, router_loss, gate_logits
@@ -393,7 +456,7 @@ class MoETransformerObserver(BaseTransformerObserver):
                 renormalize_router_weights=self.hook_config.renormalize_router_weights,
             )
 
-            # Merging critera
+            # Optional extended similarity statistics retained for compatibility.
             if not self.hook_config.record_pruning_metrics_only:
                 ttm_similarity_matrix = ttm_online(
                     pruning_batch.activations,
@@ -482,55 +545,32 @@ class MoETransformerObserver(BaseTransformerObserver):
 @dataclass
 class Qwen3MoEObserverHookConfig(MoETransformerObserverConfig):
     module_class_name_to_hook_regex: Optional[str] = "Qwen3MoeSparseMoeBlock"
+    num_experts_attr_name: str = "experts.num_experts"
+    top_k_attr_name: str = "gate.top_k"
+    fused_experts: bool = True
+    router_attr_name: str = "gate"
+    batched_expert_weights: bool = True
 
 
 @dataclass
-class Llama4MoEObserverHookConfig(MoETransformerObserverConfig):
-    module_class_name_to_hook_regex: Optional[str] = "Llama4TextMoe"
-    fused_experts: bool = True  # Llama4 uses fused experts
+class Qwen35MoEObserverHookConfig(MoETransformerObserverConfig):
+    """Observer settings for the Qwen3.5 multimodal MoE implementation.
 
+    Qwen3.5 stores expert projections as batched tensors and returns only the
+    combined block output, so routing and per-expert activations must be
+    reconstructed from ``gate`` and ``experts``.
+    """
 
-@dataclass
-class MixtralMoEObserverHookConfig(MoETransformerObserverConfig):
-    module_class_name_to_hook_regex: Optional[str] = "MixtralSparseMoeBlock"
-
-
-@dataclass
-class DeepSeekMoEObserverHookConfig(MoETransformerObserverConfig):
-    module_class_name_to_hook_regex: Optional[str] = "DeepseekV2MoE"
-    num_experts_attr_name: str = "experts_per_rank"  # only for ep=1!
-    top_k_attr_name: str = "num_experts_per_tok"
-    fused_experts: bool = False
-
-
-@dataclass
-class Ernie4_5MoEObserverHookConfig(MoETransformerObserverConfig):
-    module_class_name_to_hook_regex: Optional[str] = "Ernie4_5_MoeMLP"
-    num_experts_attr_name: str = "num_local_experts"
-    top_k_attr_name: str = "k"
-
-    # hf in tree implementation below:
-    # module_class_name_to_hook_regex: Optional[str] = "Ernie4_5_MoESparseMoeBlock"
-    # num_experts_attr_name: str = "num_experts"
-    # top_k_attr_name: str = "top_k"
-    fused_experts: bool = False
-
-
-@dataclass
-class Glm44MoEObserverHookConfig(MoETransformerObserverConfig):
-    module_class_name_to_hook_regex: Optional[str] = "Glm4MoeMoE"
-    num_experts_attr_name: str = "config.n_routed_experts"
-    top_k_attr_name: str = "config.num_experts_per_tok"
-    fused_experts: bool = False
+    module_class_name_to_hook_regex: Optional[str] = "Qwen3_5MoeSparseMoeBlock"
+    num_experts_attr_name: str = "experts.num_experts"
+    top_k_attr_name: str = "gate.top_k"
+    fused_experts: bool = True
+    router_attr_name: str = "gate"
+    batched_expert_weights: bool = True
 
 
 OBSERVER_CONFIG_REGISTRY = {
     "Qwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
-    "NonUniformQwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
-    "Llama4ForCausalLM": Llama4MoEObserverHookConfig,
-    "MixtralForCausalLM": MixtralMoEObserverHookConfig,
-    "DeepseekV2ForCausalLM": DeepSeekMoEObserverHookConfig,
-    "Ernie4_5_MoEForCausalLM": Ernie4_5MoEObserverHookConfig,
-    "Ernie4_5_MoeForCausalLM": Ernie4_5MoEObserverHookConfig,
-    "Glm4MoeForCausalLM": Glm44MoEObserverHookConfig,
+    "Qwen3_5MoeForConditionalGeneration": Qwen35MoEObserverHookConfig,
+    "Qwen3_5MoeForCausalLM": Qwen35MoEObserverHookConfig,
 }

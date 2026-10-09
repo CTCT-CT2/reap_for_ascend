@@ -5,7 +5,7 @@ This module implements a block-wise activation collection approach inspired by A
 adapted for MoE expert pruning metrics (REAP, EAN, frequency, etc.).
 
 Key features:
-1. Only one transformer block is loaded on GPU at a time
+1. Only one transformer block is loaded on NPU at a time
 2. Hidden states are cached between blocks (passed from block N to block N+1)
 3. Streaming approach - batches are processed one at a time
 4. Progressive loading/offloading of transformer blocks
@@ -27,6 +27,7 @@ from transformers.tokenization_utils_base import BatchEncoding
 
 from reap.observer import (
     MoETransformerObserverConfig,
+    compute_batched_expert_activations,
 )
 from reap.layerwise_model_utils import (
     extract_model_components,
@@ -37,6 +38,7 @@ from reap.layerwise_model_utils import (
     safe_get_device,
     has_meta_tensors,
 )
+from reap.npu import default_device, disabled_autocast, is_available, memory_gib
 from reap.pruning_metrics import initialize_pruning_state, update_pruning_state
 from reap.metrics import OnlineStatsTracker
 
@@ -129,7 +131,7 @@ class LayerwiseMoEObserver:
     Memory-efficient MoE observer that processes one transformer block at a time.
 
     This class collects the same pruning metrics as MoETransformerObserver but
-    in a memory-efficient manner suitable for large models on single GPUs.
+    in a memory-efficient manner suitable for large models on one Ascend NPU.
 
     Metrics collected per block:
     - total_tokens: Total number of tokens processed
@@ -286,7 +288,7 @@ class LayerwiseMoEObserver:
 
         self._offload_current_block()
 
-        target_device = "cuda" if torch.cuda.is_available() else "cpu"
+        target_device = str(default_device(require=False))
         final_device = self._move_block(block, block_idx, target_device)
 
         self.currently_loaded_block_idx = block_idx
@@ -385,9 +387,7 @@ class LayerwiseMoEObserver:
                 pass
 
             if chosen_device is None:
-                chosen_device = torch.device(
-                    "cuda:0" if torch.cuda.is_available() else "cpu"
-                )
+                chosen_device = default_device(require=False)
 
             return chosen_device, chosen_dtype
 
@@ -659,8 +659,39 @@ class LayerwiseMoEObserver:
                 router_logits = result
             return router_logits
 
-        if self.hook_config.fused_experts:
-            # Fused experts (e.g., Llama-4)
+        def extract_router_output(router_module, input):
+            """Return router logits and selected expert indices."""
+            try:
+                result = router_module(input)
+            except (TypeError, ValueError):
+                if input.ndim != 2:
+                    raise
+                result = router_module(
+                    input.view(batch_size, sequence_length, hidden_dim)
+                )
+            if not isinstance(result, tuple) or len(result) < 3:
+                router_logits = result
+                _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
+            else:
+                router_logits, _, selected_experts = result[:3]
+            return router_logits, selected_experts.to(device)
+
+        if self.hook_config.batched_expert_weights:
+            # Qwen3.5-MoE returns a combined tensor from the block and stores
+            # all expert projections in batched tensors. Recompute routing and
+            # evaluate every expert in bounded chunks for REAP metrics.
+            router_module = reduce(
+                getattr,
+                self.hook_config.router_attr_name.split("."),
+                moe_module,
+            )
+            router_output = extract_router_output(router_module, flat_input)
+            router_logits, selected_experts = router_output
+            activations = compute_batched_expert_activations(
+                moe_module.experts, flat_input, num_experts
+            )
+        elif self.hook_config.fused_experts:
+            # Fused expert implementations returning routing scores.
             router_logits = extract_router_logits(moe_module.router, flat_input)
             _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
             selected_experts = selected_experts.to(device)
@@ -739,7 +770,7 @@ class LayerwiseMoEObserver:
         block = self.blocks[block_idx]
 
         if device_str == "meta":
-            device_str = "cuda" if torch.cuda.is_available() else "cpu"
+            device_str = str(default_device(require=False))
         target_device = torch.device(device_str)
 
         try:
@@ -766,7 +797,7 @@ class LayerwiseMoEObserver:
                 if before_forward is not None:
                     before_forward()
 
-                with torch.amp.autocast(device_type="cuda", enabled=False):
+                with disabled_autocast(target_device):
                     outputs = block(*block_input, **block_kwargs)
 
                 if isinstance(outputs, tuple):
@@ -899,11 +930,10 @@ class LayerwiseMoEObserver:
 
             cleanup_memory()
 
-            if torch.cuda.is_available():
-                allocated = torch.cuda.memory_allocated() / (1024**3)
-                reserved = torch.cuda.memory_reserved() / (1024**3)
+            if is_available():
+                allocated, reserved = memory_gib()
                 logger.debug(
-                    f"GPU memory after block {block_idx}: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+                    f"NPU memory after block {block_idx}: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
                 )
 
         self.replay_cache.clear()

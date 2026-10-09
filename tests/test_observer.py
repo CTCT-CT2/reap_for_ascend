@@ -8,6 +8,20 @@ from reap.observer import MoETransformerObserver
 from reap.observer import Qwen3MoEObserverHookConfig
 from reap.metrics import angular_distance
 
+
+def _set_fused_expert_weights(block, down_outputs):
+    """Configure Transformers 5.x batched Qwen3 expert tensors."""
+    block.experts.gate_up_proj.data.fill_(1.0)
+    for expert_idx, down_output in enumerate(down_outputs):
+        block.experts.down_proj.data[expert_idx].copy_(down_output)
+
+
+def _router_output(logits, top_k, device):
+    router_logits = logits.to(device)
+    selected_logits, selected_experts = torch.topk(router_logits, top_k, dim=-1)
+    routing_weights = torch.softmax(selected_logits, dim=-1)
+    return router_logits, routing_weights, selected_experts
+
 def test_ttm_similarity_matrix_zeros_case():
     # setup
     batch, seq, dim = 1, 2, 3
@@ -51,12 +65,10 @@ def test_ttm_similarity_with_manual_weights():
     # force both experts to be selected
     block.gate.weight.data.zero_()
     # override expert weights so expert0→[4,0], expert1→[0,4] on input [1,1]
-    e0, e1 = block.experts
-    for e in (e0, e1):
-        e.gate_proj.weight.data.fill_(1.0)
-        e.up_proj.weight.data.fill_(1.0)
-    e0.down_proj.weight.data.copy_(torch.tensor([[1.0],[0.0]]))
-    e1.down_proj.weight.data.copy_(torch.tensor([[0.0],[1.0]]))
+    _set_fused_expert_weights(
+        block,
+        [torch.tensor([[1.0], [0.0]]), torch.tensor([[0.0], [1.0]])],
+    )
 
     model = nn.Sequential(block)
     observer = MoETransformerObserver(model, hook_config=Qwen3MoEObserverHookConfig())
@@ -87,12 +99,10 @@ def test_ttm_similarity_with_90_deg_weights():
     # force both experts to be selected
     block.gate.weight.data.zero_()
     # override expert weights so expert0→[4,0], expert1→[0,4] on input [1,1]
-    e0, e1 = block.experts
-    for e in (e0, e1):
-        e.gate_proj.weight.data.fill_(1.0)
-        e.up_proj.weight.data.fill_(1.0)
-    e0.down_proj.weight.data.copy_(torch.tensor([[4.0],[0.0]]))
-    e1.down_proj.weight.data.copy_(torch.tensor([[0.0],[4.0]]))
+    _set_fused_expert_weights(
+        block,
+        [torch.tensor([[4.0], [0.0]]), torch.tensor([[0.0], [4.0]])],
+    )
 
     model = nn.Sequential(block)
     observer = MoETransformerObserver(model, hook_config=Qwen3MoEObserverHookConfig())
@@ -139,7 +149,7 @@ def test_pairwise_expert_frequency(logits, expected_pf):
 
     # hook gate to always emit our custom logits
     def _override_logits(module, inp, out):
-        return logits
+        return _router_output(logits, top_k, inp[0].device)
     block.gate.register_forward_hook(_override_logits)
 
     model = nn.Sequential(block)
@@ -242,16 +252,11 @@ def test_ttm_with_four_experts_and_controlled_routing(logits, expected_ttm):
         torch.tensor([[0.0], [-1.0]]), # 270 deg
     ]
 
-    for i, expert in enumerate(block.experts):
-        # These weights ensure a predictable intermediate activation
-        expert.gate_proj.weight.data.fill_(1.0)
-        expert.up_proj.weight.data.fill_(1.0)
-        # Set the down_proj weights to produce the desired output vectors
-        expert.down_proj.weight.data.copy_(expert_outputs[i])
+    _set_fused_expert_weights(block, expert_outputs)
 
     # 3. Control routing by hooking the router gate to return our logits
     def _override_gate_logits(module, inp, out):
-        return logits.to(inp[0].device)
+        return _router_output(logits, top_k, inp[0].device)
     block.gate.register_forward_hook(_override_gate_logits)
 
     # 4. Setup observer and run the model

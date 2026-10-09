@@ -9,21 +9,17 @@ from reap.args import (
     ModelArgs,
     DatasetArgs,
     ObserverArgs,
-    ClusterArgs,
-    EvalArgs,
     PruneArgs,
-    MergeArgs,
     LayerwiseArgs,
 )
 
 # The two parser configurations used by main.py and layerwise_prune.py
 MAIN_DATACLASSES = (
     ReapArgs, ModelArgs, DatasetArgs, ObserverArgs,
-    ClusterArgs, EvalArgs, MergeArgs,
 )
 LAYERWISE_DATACLASSES = (
     ReapArgs, DatasetArgs, ObserverArgs, ModelArgs,
-    EvalArgs, PruneArgs, ClusterArgs, LayerwiseArgs,
+    PruneArgs, LayerwiseArgs,
 )
 
 

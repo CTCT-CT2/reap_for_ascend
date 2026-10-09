@@ -1,0 +1,12 @@
+REAP for Ascend NPU
+
+This project is derived from the REAP project developed by Cerebras Research:
+https://github.com/CerebrasResearch/reap
+
+The upstream project provides the REAP algorithm, research implementation, and
+associated documentation. This derivative distribution adapts the observation,
+expert-pruning, container, and serving workflows for Ascend NPU environments.
+
+The upstream project and this derivative distribution are provided under the
+Apache License 2.0. Third-party models, datasets, drivers, libraries, and
+container images remain subject to their respective licenses.

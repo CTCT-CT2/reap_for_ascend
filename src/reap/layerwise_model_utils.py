@@ -13,6 +13,8 @@ import torch
 import torch.nn as nn
 from itertools import chain
 
+from reap.npu import empty_cache, synchronize as npu_synchronize
+
 logger = logging.getLogger(__name__)
 
 
@@ -93,16 +95,11 @@ def natural_sort_key(value: str) -> tuple[object, ...]:
 
 
 def cleanup_memory(synchronize: bool = True) -> None:
-    """Run Python GC and release cached CUDA memory when available."""
+    """Run Python GC and release cached Ascend NPU memory when available."""
     gc.collect()
-
-    if not torch.cuda.is_available():
-        return
-
     if synchronize:
-        torch.cuda.synchronize()
-
-    torch.cuda.empty_cache()
+        npu_synchronize()
+    empty_cache()
 
 
 def move_to_device(value: Any, target_device: torch.device) -> Any:

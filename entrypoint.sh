@@ -1,17 +1,15 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-# If a marker file doesn't exist in the venv, it means dependencies are not installed.
-# Execute the build script to set up the Python environment.
-# Your build script should create this marker file upon completion.
-if [ ! -f ".venv/.build_complete" ]; then
-  echo "Dependencies not installed. Running build script..."
-  sudo chown -R dev:dev /app/.venv
-  sudo chown -R dev:dev /home/dev/.cache
-  sudo chown -R dev:dev /tmp
-  /bin/bash scripts/build.sh
-  echo "Build script finished."
-fi
+python - <<'PY'
+import torch
+import torch_npu  # noqa: F401
 
-# Execute the command passed to the container (e.g., bash).
+if not torch.npu.is_available():
+    raise SystemExit(
+        "Ascend NPU unavailable: check driver mounts and ASCEND_RT_VISIBLE_DEVICES"
+    )
+print(f"Ascend runtime ready: {torch.npu.device_count()} visible NPU(s)")
+PY
+
 exec "$@"

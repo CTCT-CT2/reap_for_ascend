@@ -1,32 +1,39 @@
-volumes:
-  venv_data:
 services:
-  app:
+  reap-npu:
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        USER_ID: ${USER_ID:-1000}
-        GROUP_ID: ${GROUP_ID:-1000}
-      network: host
-    volumes:
-      - .:/app:rw
-      - ~/.cache/huggingface:/home/dev/.cache/huggingface
-      - venv_data:/app/.venv
-    working_dir: /app
+        VLLM_ASCEND_IMAGE: ${VLLM_ASCEND_IMAGE:-quay.io/ascend/vllm-ascend:v0.23.0-openeuler}
+    image: ${REAP_IMAGE_NAME:-reap-ascend:latest}
+    privileged: true
+    security_opt:
+      - label=disable
+    ipc: host
+    shm_size: 64g
+    network_mode: host
+    working_dir: /workspace/reap
     tty: true
     stdin_open: true
-    shm_size: "16g"
-    mem_limit: "1t"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    volumes:
+      - .:/workspace/reap:rw
+      - ${MODEL_ROOT:-./models}:/models:rw
+      - /usr/local/dcmi:/usr/local/dcmi
+      - /usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64
+      - /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info
+      - /usr/local/Ascend/driver/tools/hccn_tool:/usr/local/Ascend/driver/tools/hccn_tool
+      - /usr/local/bin/npu-smi:/usr/local/bin/npu-smi
+      - /etc/ascend_install.info:/etc/ascend_install.info
+      - /etc/hccn.conf:/etc/hccn.conf
+      - /etc/vnpu.cfg:/etc/vnpu.cfg
+      - ${HF_CACHE_DIR:-./.cache/huggingface}:/root/.cache/huggingface
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
-      - NVIDIA_DRIVER_CAPABILITIES=all
-    network_mode: host
+      ASCEND_RT_VISIBLE_DEVICES: ${NPU_DEVICES:-0,1,2,3}
+      PYTHONPATH: /workspace/reap/src
+      PYTORCH_NPU_ALLOC_CONF: expandable_segments:True
+      HCCL_CONNECT_TIMEOUT: "1800"
+      HCCL_EXEC_TIMEOUT: "1800"
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
