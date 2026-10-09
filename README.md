@@ -25,6 +25,22 @@ vLLM-Ascend 部署。
 - 生成兼容 Transformers 和 vLLM-Ascend 的 checkpoint
 - 默认使用 0–3 号 NPU 启动 OpenAI 兼容推理服务
 
+## 专家贡献与路由分布
+
+REAP 的剪枝依据来自观测阶段统计的路由频率与专家激活贡献。下图是一份 MoE 专家
+贡献与逐层路由分布的分析示例（DeepSeek V4-Flash，43 层，每层 256 个路由专家加
+1 个共享专家，每 Token 激活 Top-6，基于 9,315 条样本统计）：
+
+![MoE 专家贡献与逐层路由分布](docs/images/moe-expert-contribution-deepseek-v4-flash.png)
+
+图中可见两类典型分布：多数层平均覆盖约 190 个专家，激活较为分散；而 L1–L2 仅
+Expert 0 被选中，路由高度集中。这种层间差异正是按层评估专家贡献、而不是全局统一
+裁剪的原因。观测文件的专家活跃度排序与分布统计可用
+[`scripts/analyze_expert_activity.py`](scripts/analyze_expert_activity.py) 生成。
+
+> 该图仅用于说明专家贡献的分析方法，所用模型不在当前支持范围内；本仓库当前支持
+> Qwen3 和 Qwen3.5 MoE。
+
 ## 支持环境
 
 - Linux 与可用的昇腾 NPU
